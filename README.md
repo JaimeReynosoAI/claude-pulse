@@ -4,9 +4,10 @@ A small Linux system tray widget that shows your Claude Pro subscription
 usage: the 5-hour rolling session window and the 7-day rolling weekly
 window, each with utilization % and time until reset.
 
-Click the tray icon for a dropdown menu with the current numbers. The icon
-itself also changes to a warning/error glyph when usage crosses 80% / 95%,
-so you get a signal without even opening the menu.
+The tray icon itself is two small ring charts (5h, 7d) that fill up and
+change color — green/amber/red — as usage climbs, so you get a signal
+without opening anything. Click it for a dropdown with the same numbers as
+plain text.
 
 ## How it works
 
@@ -77,18 +78,32 @@ To remove it: delete `~/.config/autostart/claude-pulse.desktop`.
 
 ## Behavior notes
 
-- **No background polling loop.** ClaudePulse fetches once at startup, then
-  again whenever you open the tray menu *if* the cached data is stale
-  (older than `CACHE_TTL_SECONDS`, 3 minutes by default) or you click
-  "Refresh now". Opening the menu always shows the last known values
-  instantly — the refresh (if any) happens in the background and updates
-  the menu in place when it completes.
+- **Auto-refreshes every 5 minutes.** ClaudePulse fetches once at startup,
+  then on a background timer every `REFRESH_INTERVAL_SECONDS` (5 minutes by
+  default), and whenever you click "Refresh now". Opening the tray dropdown
+  does *not* trigger a fetch — it just repaints from whatever was last
+  fetched, instantly.
 - **Rate-limit friendly.** Fetch *attempts* (successful or not) are floored
-  to at most one per `MIN_RETRY_INTERVAL_SECONDS` (20s), so rapidly
-  clicking the icon or "Refresh now" won't hammer the endpoint.
+  to at most one per `MIN_RETRY_INTERVAL_SECONDS` (20s), so rapid manual
+  "Refresh now" clicks won't hammer the endpoint.
 - **Degrades gracefully.** Network errors or a 429 fall back to showing the
   last cached numbers with a small warning note, rather than blanking the
   display.
+
+## Limitations
+
+- **The dropdown menu can't be restyled.** AppIndicator menus on Ubuntu
+  GNOME are proxied to the shell over DBusMenu — the shell renders the
+  popup itself, and its GTK exporter reads item text as plain text only
+  (Pango markup, per-item CSS, and custom widgets are all dropped or
+  squashed in transit; a wide custom icon gets forced into a small fixed
+  square). Getting a real dark background or a real progress bar in the
+  dropdown would mean dropping AppIndicator's menu entirely and hand-rolling
+  a custom popup window with its own D-Bus StatusNotifierItem service — a
+  much bigger rewrite. Since this is a personal tool, we chose plain text in
+  the dropdown (matching every other tray indicator on the system) and put
+  all the visual effort into the tray icon itself, where custom rendering
+  (rings, color) genuinely works.
 
 ## Files
 
@@ -100,7 +115,7 @@ To remove it: delete `~/.config/autostart/claude-pulse.desktop`.
 
 ## Tuning
 
-Cache TTL, retry floor, and the warning/critical usage thresholds are all
-plain constants near the top of `claude_pulse.py`
-(`CACHE_TTL_SECONDS`, `MIN_RETRY_INTERVAL_SECONDS`, `WARNING_THRESHOLD`,
-`CRITICAL_THRESHOLD`).
+Refresh interval, retry floor, and the green/amber/red usage thresholds are
+all plain constants near the top of `claude_pulse.py`
+(`REFRESH_INTERVAL_SECONDS`, `MIN_RETRY_INTERVAL_SECONDS`, `GREEN_MAX`,
+`YELLOW_MAX`).

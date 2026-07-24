@@ -21,7 +21,9 @@ except (ValueError, ImportError):
     gi.require_version("AppIndicator3", "0.1")
     from gi.repository import AppIndicator3
 
+import cairo
 import json
+import math
 import os
 import re
 import subprocess
@@ -47,16 +49,107 @@ CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "claude-pulse"
 CACHE_PATH = CACHE_DIR / "usage.json"
 
-CACHE_TTL_SECONDS = 180  # how long a successful fetch is considered fresh
+REFRESH_INTERVAL_SECONDS = 300  # both the auto-refresh timer cadence and cache freshness window
 MIN_RETRY_INTERVAL_SECONDS = 20  # floor between fetch *attempts*, success or not
 
-WARNING_THRESHOLD = 80.0
-CRITICAL_THRESHOLD = 95.0
+# Thresholds for the 5-hour session ring, in percent utilization.
+GREEN_MAX = 60.0   # below this: green
+YELLOW_MAX = 85.0  # below this: yellow, at/above: red
 
+SEVERITY_RGB = {
+    "ok": (0.086, 0.639, 0.290),        # #16a34a
+    "warn": (0.851, 0.467, 0.024),      # #d97706
+    "critical": (0.863, 0.149, 0.149),  # #dc2626
+}
 ICON_NORMAL = "utilities-system-monitor-symbolic"
-ICON_WARNING = "dialog-warning-symbolic"
-ICON_CRITICAL = "dialog-error-symbolic"
 ICON_AUTH_ERROR = "dialog-error-symbolic"
+
+# Custom ring-chart icons are rendered to PNGs here and looked up by name via
+# indicator.set_icon_theme_path(). We alternate between two file names on
+# every update — AppIndicator/GNOME Shell caches icons by name and won't
+# notice a file's *contents* changing under a name it has already seen.
+ICON_DIR = CACHE_DIR / "icons"
+ICON_NAMES = ("cp-usage-a", "cp-usage-b")
+ICON_BACKDROP_RGBA = (0.11, 0.11, 0.13, 1.0)  # near-black disc for contrast on any panel color
+ICON_TRACK_RGBA = (1.0, 1.0, 1.0, 0.16)  # faint full ring behind the usage arc
+ICON_LABEL_RGBA = (1.0, 1.0, 1.0, 0.85)
+
+# Two ring charts side by side (5-hour session, 7-day week), each preceded
+# by a small bold label. Row height stays fixed; width grows to fit both.
+ICON_ROW_HEIGHT = 64
+ICON_RING_SIZE = 56
+ICON_LABEL_FONT_SIZE = 30
+ICON_LABEL_GAP = 6     # between a label and its ring
+ICON_GROUP_GAP = 16    # between the 5h group and the 7d group
+ICON_SIDE_PADDING = 1
+
+
+def usage_severity(pct):
+    if pct is None:
+        return None
+    if pct < GREEN_MAX:
+        return "ok"
+    if pct < YELLOW_MAX:
+        return "warn"
+    return "critical"
+
+
+def _draw_ring(ctx, cx, cy, outer_radius, pct):
+    ctx.set_source_rgba(*ICON_BACKDROP_RGBA)
+    ctx.arc(cx, cy, outer_radius, 0, 2 * math.pi)
+    ctx.fill()
+
+    radius = outer_radius * 0.72
+    ctx.set_line_width(outer_radius * 0.32)
+    ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+
+    ctx.set_source_rgba(*ICON_TRACK_RGBA)
+    ctx.arc(cx, cy, radius, 0, 2 * math.pi)
+    ctx.stroke()
+
+    severity = usage_severity(pct)
+    if severity is not None and pct > 0:
+        fraction = min(pct, 100.0) / 100.0
+        start = -math.pi / 2
+        end = start + fraction * 2 * math.pi
+        ctx.set_source_rgb(*SEVERITY_RGB[severity])
+        ctx.arc(cx, cy, radius, start, end)
+        ctx.stroke()
+
+
+def render_usage_icon(five_pct, seven_pct, path):
+    """Draws two ring charts side by side — 5-hour session, then 7-day
+    week — each with a small "5h"/"7d" label, and writes the result as a
+    PNG. A pct of None (loading/unknown) is drawn as an empty track."""
+    # A 1x1 probe surface just to measure label width via text_extents
+    # before we know the final canvas size.
+    probe_ctx = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1))
+    probe_ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    probe_ctx.set_font_size(ICON_LABEL_FONT_SIZE)
+    label_width = max(probe_ctx.text_extents(t)[2] for t in ("5h", "7d"))
+
+    group_width = label_width + ICON_LABEL_GAP + ICON_RING_SIZE
+    width = ICON_SIDE_PADDING * 2 + group_width * 2 + ICON_GROUP_GAP
+    height = ICON_ROW_HEIGHT
+
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, int(width), height)
+    ctx = cairo.Context(surface)
+    ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    ctx.set_font_size(ICON_LABEL_FONT_SIZE)
+    ascent, descent = ctx.font_extents()[:2]
+    text_y = height / 2 + (ascent - descent) / 2
+
+    x = ICON_SIDE_PADDING
+    for label, pct in (("5h", five_pct), ("7d", seven_pct)):
+        ctx.set_source_rgba(*ICON_LABEL_RGBA)
+        ctx.move_to(x, text_y)
+        ctx.show_text(label)
+        x += label_width + ICON_LABEL_GAP
+
+        _draw_ring(ctx, x + ICON_RING_SIZE / 2, height / 2, ICON_RING_SIZE / 2, pct)
+        x += ICON_RING_SIZE + ICON_GROUP_GAP
+
+    surface.write_to_png(str(path))
 
 
 class CredentialsError(Exception):
@@ -196,10 +289,10 @@ def fmt_reset(iso_str):
     minutes, _ = divmod(rem, 60)
 
     if days > 0:
-        return f"resets in {days}d {hours}h"
+        return f"resets in: {days}d {hours}h"
     if hours > 0:
-        return f"resets in {hours}h {minutes}m"
-    return f"resets in {minutes}m"
+        return f"resets in: {hours}h {minutes}m"
+    return f"resets in: {minutes}m"
 
 
 def fmt_age(seconds):
@@ -242,7 +335,7 @@ class UsageStore:
             return False
         if force or self.data is None:
             return True
-        return (time.time() - self.data["fetched_at"]) >= CACHE_TTL_SECONDS
+        return (time.time() - self.data["fetched_at"]) >= REFRESH_INTERVAL_SECONDS
 
     def start_refresh_if_needed(self, on_update, force=False):
         with self.lock:
@@ -297,22 +390,6 @@ class UsageStore:
             GLib.idle_add(on_update)
 
 
-def choose_icon(snapshot):
-    if snapshot["error_kind"] == "auth":
-        return ICON_AUTH_ERROR
-    data = snapshot["data"]
-    if data is None:
-        return ICON_NORMAL
-    five = data["five_hour"]["utilization"] or 0
-    seven = data["seven_day"]["utilization"] or 0
-    peak = max(five, seven)
-    if peak >= CRITICAL_THRESHOLD:
-        return ICON_CRITICAL
-    if peak >= WARNING_THRESHOLD:
-        return ICON_WARNING
-    return ICON_NORMAL
-
-
 class TrayApp:
     """Builds the tray menu once with stable widget references and mutates
     their labels/sensitivity in place. AppIndicator menus are proxied to
@@ -325,7 +402,6 @@ class TrayApp:
     def __init__(self):
         self.store = UsageStore()
         self.menu = Gtk.Menu()
-
         self.status_item = self._label_item("Fetching usage…")
         self.week_item = self._label_item("")
         self.warning_item = self._label_item("")
@@ -344,79 +420,98 @@ class TrayApp:
         self.menu.show_all()
         self.menu.connect("show", self.on_menu_show)
 
+        ICON_DIR.mkdir(parents=True, exist_ok=True)
+        self._icon_slot = 0
+
         self.indicator = AppIndicator3.Indicator.new(
             APP_ID, ICON_NORMAL, AppIndicator3.IndicatorCategory.APPLICATION_STATUS
         )
         self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
         self.indicator.set_title("ClaudePulse")
+        self.indicator.set_icon_theme_path(str(ICON_DIR))
         self.indicator.set_menu(self.menu)
 
         self.apply_snapshot()
         self.store.start_refresh_if_needed(self.on_data_updated)
+        GLib.timeout_add_seconds(REFRESH_INTERVAL_SECONDS, self.on_timer_tick)
 
     def _label_item(self, text):
         # A display-only row. We deliberately avoid set_sensitive(False):
         # GTK renders insensitive items in the theme's dimmed/grey style,
-        # which is what made these rows hard to read. Forcing the label
-        # color via markup keeps them legible regardless of the system
-        # theme. They stay unhooked from any "activate" handler, so
-        # clicking one just dismisses the menu like clicking blank space.
-        item = Gtk.MenuItem()
-        label = Gtk.Label(xalign=0)
-        item.add(label)
-        self._set_item_text(item, text)
-        return item
-
-    def _set_item_text(self, item, text):
-        item.get_child().set_markup(f'<span color="black">{GLib.markup_escape_text(text)}</span>')
+        # which is what made these rows hard to read. Leaving them sensitive
+        # (but with no "activate" handler) keeps them legible under both
+        # light and dark themes, since they just inherit the normal
+        # foreground color instead of a hardcoded one. Clicking one just
+        # dismisses the menu like clicking blank space.
+        #
+        # Plain text only, no markup: AppIndicator menus are proxied to
+        # GNOME Shell over DBusMenu, whose GTK exporter reads item text with
+        # gtk_label_get_text() — Pango markup (color, alpha, weight) is
+        # silently dropped in transit, and per-item icons get forced into a
+        # small fixed square. The shell owns this menu's rendering; custom
+        # styling isn't available here, so we don't pretend otherwise.
+        return Gtk.MenuItem(label=text)
 
     def apply_snapshot(self):
         snap = self.store.snapshot()
 
         if snap["error_kind"] == "auth":
-            self._set_item_text(self.status_item, snap["error"])
+            self.status_item.set_label(snap["error"])
             self.week_item.hide()
             self.warning_item.hide()
             self.updated_item.hide()
         elif snap["data"] is None:
-            self._set_item_text(self.status_item, snap["error"] or "Fetching usage…")
+            self.status_item.set_label(snap["error"] or "Fetching usage…")
             self.week_item.hide()
             self.warning_item.hide()
             self.updated_item.hide()
         else:
             five = snap["data"]["five_hour"]
             seven = snap["data"]["seven_day"]
-            self._set_item_text(
-                self.status_item,
-                f"Session: {fmt_pct(five['utilization'])} used — {fmt_reset(five['resets_at'])}",
+            self.status_item.set_label(
+                f"Session: {fmt_pct(five['utilization'])} used — {fmt_reset(five['resets_at'])}"
             )
-            self._set_item_text(
-                self.week_item,
-                f"Week: {fmt_pct(seven['utilization'])} used — {fmt_reset(seven['resets_at'])}",
+            self.week_item.set_label(
+                f"Week: {fmt_pct(seven['utilization'])} used — {fmt_reset(seven['resets_at'])}"
             )
             self.week_item.show()
             if snap["error_kind"] in ("rate_limited", "network"):
-                self._set_item_text(self.warning_item, f"⚠ {snap['error']}")
+                self.warning_item.set_label(f"⚠ {snap['error']}")
                 self.warning_item.show()
             else:
                 self.warning_item.hide()
             age = time.time() - snap["data"]["fetched_at"]
-            self._set_item_text(self.updated_item, f"Updated {fmt_age(age)}")
+            self.updated_item.set_label(f"Updated {fmt_age(age)}")
             self.updated_item.show()
 
         self.refresh_item.set_sensitive(not snap["fetching"])
         self.update_icon(snap)
 
     def update_icon(self, snap):
-        self.indicator.set_icon_full(choose_icon(snap), "Claude Pulse")
+        if snap["error_kind"] == "auth":
+            self.indicator.set_icon_full(ICON_AUTH_ERROR, "Claude Pulse — action needed")
+            return
+        data = snap["data"]
+        five_pct = data["five_hour"]["utilization"] if data else None
+        seven_pct = data["seven_day"]["utilization"] if data else None
+        name = ICON_NAMES[self._icon_slot % 2]
+        self._icon_slot += 1
+        render_usage_icon(five_pct, seven_pct, ICON_DIR / f"{name}.png")
+        self.indicator.set_icon_full(name, "Claude Pulse")
 
     def on_menu_show(self, _menu):
+        # Just repaints from the current snapshot (e.g. to update the "Updated
+        # Xm ago" text) — no network call. Fetching happens on the timer, at
+        # startup, and via "Refresh now", not on every time the user looks.
         self.apply_snapshot()
-        self.store.start_refresh_if_needed(self.on_data_updated)
 
     def on_refresh_clicked(self, *_args):
         self.store.start_refresh_if_needed(self.on_data_updated, force=True)
         self.apply_snapshot()
+
+    def on_timer_tick(self):
+        self.store.start_refresh_if_needed(self.on_data_updated)
+        return True  # GLib.timeout_add_seconds: keep repeating
 
     def on_data_updated(self):
         self.apply_snapshot()
